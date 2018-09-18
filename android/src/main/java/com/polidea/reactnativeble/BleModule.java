@@ -1,6 +1,8 @@
 package com.polidea.reactnativeble;
 
+import android.annotation.TargetApi;
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothGattCharacteristic;
 import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
@@ -9,9 +11,11 @@ import android.content.Context;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.ParcelUuid;
+import android.os.Handler;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
 import android.support.annotation.RequiresApi;
+import android.util.Log;
 import android.util.SparseArray;
 
 import com.facebook.react.bridge.Arguments;
@@ -53,15 +57,29 @@ import com.polidea.rxandroidble.scan.ScanFilter;
 import com.polidea.rxandroidble.scan.ScanResult;
 import com.polidea.rxandroidble.scan.ScanSettings;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
+import br.com.vertitecnologia.vmpay.utils.Base32768Util;
+import br.com.vertitecnologia.vmpay.utils.FileUtil;
+import br.com.vertitecnologia.vmpay.utils.StringUtil;
+import br.com.vertitecnologia.vmpay.vmbox.Package;
+import rx.Notification;
 import rx.Observable;
 import rx.Observer;
+import rx.Single;
 import rx.Subscription;
 import rx.functions.Action0;
 import rx.functions.Action1;
@@ -673,6 +691,7 @@ public class BleModule extends ReactContextBaseJavaModule {
         safeConnectToDevice(device, autoConnect, requestMtu, refreshGattMoment, timeout, connectionPriority, new SafePromise(promise));
     }
 
+
     private void safeConnectToDevice(final RxBleDevice device,
                                      final boolean autoConnect,
                                      final int requestMtu,
@@ -769,6 +788,7 @@ public class BleModule extends ReactContextBaseJavaModule {
                         Device jsDevice = new Device(device, connection);
                         cleanServicesAndCharacteristicsForDevice(jsDevice);
                         connectedDevices.put(device.getMacAddress(), jsDevice);
+
                         promise.resolve(jsDevice.toJSObject(null));
                     }
                 });
@@ -1103,6 +1123,7 @@ public class BleModule extends ReactContextBaseJavaModule {
                 promise);
     }
 
+
     private void writeCharacteristicWithValue(final Characteristic characteristic,
                                               final String valueBase64,
                                               final Boolean response,
@@ -1165,6 +1186,58 @@ public class BleModule extends ReactContextBaseJavaModule {
                         promise.resolve(characteristic.toJSObject(bytes));
                     }
                 });
+
+        transactions.replaceSubscription(transactionId, subscription);
+    }
+
+    private void safeLongWriteCharacteristicForDevice(final Characteristic characteristic,
+                                                 final byte[] value,
+                                                 final String transactionId,
+                                                 final SafePromise promise) {
+        final RxBleConnection connection = getConnectionOrReject(characteristic.getService().getDevice(), promise);
+        if (connection == null) {
+            return;
+        }
+
+
+        final Subscription subscription = connection
+            .createNewLongWriteBuilder()
+            .setCharacteristic(characteristic.getNativeCharacteristic())
+            .setBytes(value)
+            .build()
+            .doOnUnsubscribe(new Action0() {
+                @Override
+                public void call() {
+                    BleErrorUtils.cancelled().reject(promise);
+                    transactions.removeSubscription(transactionId);
+                }
+            })
+            .subscribe(new Observer<byte[]>() {
+                @Override
+                public void onCompleted() {
+                    Log.i("RNVerti", "Escrito");
+                    transactions.removeSubscription(transactionId);
+                }
+
+                @Override
+                public void onError(Throwable e) {
+                    if (e instanceof BleCharacteristicNotFoundException) {
+                        BleErrorUtils.characteristicNotFound(
+                            UUIDConverter.fromUUID(
+                                characteristic.getNativeCharacteristic().getUuid()))
+                            .reject(promise);
+                        return;
+                    }
+                    errorConverter.toError(e).reject(promise);
+                    transactions.removeSubscription(transactionId);
+                }
+
+                @Override
+                public void onNext(byte[] bytes) {
+                    characteristic.logValue("Write to", bytes);
+                    promise.resolve(characteristic.toJSObject(bytes));
+                }
+            });
 
         transactions.replaceSubscription(transactionId, subscription);
     }
@@ -1354,6 +1427,7 @@ public class BleModule extends ReactContextBaseJavaModule {
 
                     @Override
                     public void onNext(byte[] bytes) {
+                        Log.i("RNVerti", "Recebido " + StringUtil.byteArrayToString(bytes, Charset.forName("ISO-8859-1")));
                         characteristic.logValue("Notification from", bytes);
                         WritableArray jsResult = Arguments.createArray();
                         jsResult.pushNull();
@@ -1869,5 +1943,543 @@ public class BleModule extends ReactContextBaseJavaModule {
                 discoveredDescriptors.remove(key);
             }
         }
+    }
+
+    // Métodos para atualização de config e firmware
+    private List<String> configBlocks = new ArrayList<>();
+    @ReactMethod
+    public void loadConfigFile(String path, Promise promise) {
+        try {
+            this.configBlocks.clear();
+            this.configBlocks.add("00");
+
+            byte[] fileData = FileUtil.readBytes(path);
+            this.configBlocks.addAll(buildBlocks(fileData));
+
+            WritableArray ret = Arguments.createArray();
+            for (String s: configBlocks) {
+                ret.pushString(s);
+            }
+            promise.resolve(ret);
+        } catch (IOException ioe) {
+            promise.reject(ioe);
+        }
+    }
+
+    @ReactMethod
+    public void sendFilePackage(String deviceUUID, int type, int pkg, int fromBlock, int numBlocks, final Promise promise) {
+        Log.i("RNVerti", String.format("D %s | T %d | P %d | B %d | N %d", deviceUUID, type, pkg, fromBlock, numBlocks));
+        final Charset charset = Charset.forName("ISO-8859-1");
+        final Characteristic characteristic = getCharacteristicOrReject(
+            deviceUUID, "ffe0", "ffe1", promise);
+        if (characteristic == null) return;
+
+        final RxBleConnection connection = getConnectionOrReject(characteristic.getService().getDevice(), promise);
+        if (connection == null) return;
+
+        final BluetoothGattCharacteristic gattCharacteristic = characteristic.getNativeCharacteristic();
+
+        gattCharacteristic
+            .setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+
+        List<String> blocks = (type == 0) ? this.configBlocks : this.firmwareBlocks;
+
+        final int toBlock = Math.min(fromBlock + numBlocks, blocks.size());
+        final List<String> commands = new ArrayList<>();
+        int j = 0;
+        for (int i = fromBlock; i < toBlock; i++, j++) {
+            commands.add(
+                new Package(pkg + j, "07", Arrays.asList(
+                    String.format("%02x%02x", (i) & 0xff, (i >> 8) & 0xff),
+                    blocks.get(i)
+                )).toCommand()
+            );
+        }
+        if ((fromBlock + numBlocks) != toBlock) {
+            commands.add(
+                new Package(pkg + j + 1, "07", Arrays.asList("FFFF", "")).toCommand()
+            );
+        }
+
+        ArrayList<Observable<byte[]>> obs = new ArrayList<>();
+        for (String cmd : commands) {
+            obs.add(connection.createNewLongWriteBuilder()
+                .setCharacteristic(characteristic.getNativeCharacteristic())
+                .setBytes(StringUtil.stringToByteArray(cmd, charset))
+                .build()
+            );
+        }
+
+//        Observable.just(connection)
+//            .flatMap(new Func1<RxBleConnection, Observable<Observable<byte[]>>>() {
+//                @Override
+//                public Observable<Observable<byte[]>> call(RxBleConnection connection) {
+//                    return connection.setupNotification(gattCharacteristic);
+//                }
+//            })
+//            .flatMap(new Func1<Observable<byte[]>, Observable<byte[]>>() {
+//                @Override
+//                public Observable<byte[]> call(Observable<byte[]> observable) {
+//                    return observable;
+//                }
+//            })
+//            .doOnUnsubscribe(new Action0() {
+//                @Override
+//                public void call() {
+//                    promise.resolve(null);
+//                }
+//            })
+//            .subscribe(new Observer<byte[]>() {
+//                @Override
+//                public void onCompleted() {
+//                    promise.resolve(null);
+//                }
+//
+//                @Override
+//                public void onError(Throwable e) {
+//                    errorConverter.toError(e).reject(promise);
+//                }
+//
+//                @Override
+//                public void onNext(byte[] bytes) {
+//                    String msg = String.format("Recebido %s", StringUtil.byteArrayToString(bytes, charset));
+//                    Log.i("RNVerti", msg);
+//                }
+//            });
+
+
+        Observable.concat(obs)
+            .doOnNext(new Action1<byte[]>() {
+                @Override
+                public void call(byte[] bytes) {
+                    Log.i("RNVerti", "Escrito comando: " + StringUtil.byteArrayToString(bytes, Charset.forName("ISO-8859-1")));
+                }
+            })
+            .doOnCompleted(new Action0() {
+                @Override
+                public void call() {
+                    Log.i("RNVerti", "Escritos todos os comandos para a box");
+                    promise.resolve(toBlock);
+                }
+            })
+            .doOnError(new Action1<Throwable>() {
+                @Override
+                public void call(Throwable throwable) {
+                    Log.e("RNVerti", throwable.getMessage());
+                    promise.reject(throwable);
+                }
+            })
+            .subscribe();
+
+//        List<String> data = new ArrayList<>();
+//        if (fromBlock < blocks.size()) {
+//            data.add(String.format("%02x%02x", fromBlock & 0xff, (fromBlock >> 8) & 0xff));
+//            data.add(blocks.get(fromBlock));
+//        } else {
+//            data.add("FFFF");
+//            data.add("");
+//        }
+//
+//        Log.i("RNVerti", String.format("Escrevendo bloco %d - %s | %s", fromBlock, data.get(0), data.get(1)));
+//        String cmd = new Package(pkg, "07", data).toCommand();
+//
+//        safeLongWriteCharacteristicForDevice(
+//            characteristic,
+//            cmd.getBytes(Charset.forName("ISO-8859-1")),
+//            null,
+//            new SafePromise(promise)
+//        );
+    }
+
+
+    private List<String> firmwareBlocks = new ArrayList<>();
+    @ReactMethod
+    public void loadFirmwareFile(String path, Promise promise) {
+        try {
+            this.firmwareBlocks.clear();
+            this.firmwareBlocks.add("01");
+
+            byte[] fileData = FileUtil.readBytesFromPackageUpdateZip(path);
+
+            if (fileData == null) {
+                promise.reject(new RuntimeException("Error while load zip file data"));
+                return;
+            }
+
+            this.firmwareBlocks.addAll(buildBlocks(fileData));
+
+            WritableArray ret = Arguments.createArray();
+            for (String s: firmwareBlocks) {
+                ret.pushString(s);
+            }
+            promise.resolve(ret);
+        } catch (IOException ioe) {
+            promise.reject(ioe);
+        }
+    }
+
+    private List<String> buildBlocks(byte[] fileData) throws IOException {
+        List<String> blocks = new ArrayList<>();
+        for (int i = 0; i <= (fileData.length / 450); i++) {
+            int from = i * 450;
+            int to = Math.min(from + 450, fileData.length);
+
+            byte[] blockData = Arrays.copyOfRange(fileData, from, to);
+            ByteArrayInputStream bis = new ByteArrayInputStream(blockData);
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            Base32768Util.encode(bis, bos);
+
+            blocks.add(StringUtil.byteArrayToString(bos.toByteArray(), Charset.forName("ISO-8859-1")));
+        }
+        return blocks;
+    }
+
+    @ReactMethod
+    public void sendConfigFile(String deviceUUID, String path, int pkg, int block, final Promise promise) {
+        List<String> blocks = new ArrayList<>();
+        try {
+            blocks.clear();
+            blocks.add("00");
+            byte[] fileData = FileUtil.readBytes(path);
+            blocks.addAll(buildBlocks(fileData));
+
+            final List<String> commands = new ArrayList<>();
+            int i = 0;
+            for (i = 0; i < blocks.size(); i++) {
+                commands.add(
+                    new Package(pkg + i, "07", Arrays.asList(
+                        String.format("%02x%02x", (block + i) & 0xff, ((block + i) >> 8) & 0xff),
+                        blocks.get(i)
+                    )).toCommand()
+                );
+            }
+            commands.add(
+                new Package(pkg + i + 1, "07", Arrays.asList("FFFF", "")).toCommand()
+            );
+
+            final Characteristic characteristic = getCharacteristicOrReject(
+                deviceUUID, "ffe0", "ffe1", promise);
+
+            final RxBleConnection connection = getConnectionOrReject(characteristic.getService().getDevice(), promise);
+            if (connection == null) {
+                return;
+            }
+
+
+
+            ArrayList<Observable<byte[]>> obs = new ArrayList<>();
+            for (String cmd : commands) {
+                obs.add(connection.createNewLongWriteBuilder()
+                    .setCharacteristic(characteristic.getNativeCharacteristic())
+                    .setBytes(StringUtil.stringToByteArray(cmd, Charset.forName("ISO-8859-1")))
+                    .build()
+                );
+            }
+
+
+
+            Observable.concat(obs)
+                .doOnNext(new Action1<byte[]>() {
+                    @Override
+                    public void call(byte[] bytes) {
+                        Log.i("RNVerti", "Escrito comando: " + StringUtil.byteArrayToString(bytes, Charset.forName("ISO-8859-1")));
+                    }
+                })
+                .doOnCompleted(new Action0() {
+                    @Override
+                    public void call() {
+                        Log.i("RNVerti", "Escritos todos os comandos para a box");
+                        promise.resolve(null);
+                    }
+                })
+                .doOnError(new Action1<Throwable>() {
+                    @Override
+                    public void call(Throwable throwable) {
+                        Log.e("RNVerti", throwable.getMessage());
+                        promise.reject(throwable);
+                    }
+                })
+                .subscribe();
+        } catch (IOException ioe) {
+            promise.reject(ioe);
+        }
+    }
+
+    @TargetApi(21)
+    @ReactMethod
+    public void sendFirmwareFile2(String deviceUUID, String path, int pkg, int block, final Promise promise) {
+        List<String> blocks = new ArrayList<>();
+        try {
+            blocks.clear();
+            blocks.add("01");
+            byte[] fileData = FileUtil.readBytesFromPackageUpdateZip(path);
+            blocks.addAll(buildBlocks(fileData));
+
+            final List<String> commands = new ArrayList<>();
+            int i = 0;
+            for (i = 0; i < blocks.size(); i++) {
+                commands.add(
+                    new Package(pkg + i, "07", Arrays.asList(
+                        String.format("%02x%02x", (block + i) & 0xff, ((block + i) >> 8) & 0xff),
+                        blocks.get(i)
+                    )).toCommand()
+                );
+            }
+            commands.add(
+                new Package(pkg + i + 1, "07", Arrays.asList("FFFF", "")).toCommand()
+            );
+
+            final Characteristic characteristic = getCharacteristicOrReject(
+                deviceUUID, "ffe0", "ffe1", promise);
+
+            final RxBleConnection connection = getConnectionOrReject(characteristic.getService().getDevice(), promise);
+            if (connection == null) {
+                return;
+            }
+
+
+            ArrayList<Observable<byte[]>> obs = new ArrayList<>();
+            for (String cmd : commands) {
+                obs.add(connection.createNewLongWriteBuilder()
+                    .setCharacteristic(characteristic.getNativeCharacteristic())
+                    .setBytes(StringUtil.stringToByteArray(cmd, Charset.forName("ISO-8859-1")))
+                    .build()
+                );
+            }
+
+
+            connection.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH, 5, TimeUnit.SECONDS).subscribe();
+            Observable.concat(obs)
+                .doOnNext(new Action1<byte[]>() {
+                    @Override
+                    public void call(byte[] bytes) {
+                        Log.i("RNVerti", "Escrito comando: " + StringUtil.byteArrayToString(bytes, Charset.forName("ISO-8859-1")));
+                        try {
+                            Thread.sleep(100);
+                        } catch (InterruptedException ie) {
+                            promise.reject(ie);
+                        }
+                    }
+                })
+                .doOnCompleted(new Action0() {
+                    @Override
+                    public void call() {
+                        Log.i("RNVerti", "Escritos todos os comandos para a box");
+                        promise.resolve(null);
+                    }
+                })
+                .doOnError(new Action1<Throwable>() {
+                    @Override
+                    public void call(Throwable throwable) {
+                        Log.e("RNVerti", throwable.getMessage());
+                        promise.reject(throwable);
+                    }
+                })
+                .subscribe();
+        } catch (IOException ioe) {
+            promise.reject(ioe);
+        }
+    }
+
+    @ReactMethod
+    public void sendFirmwareFile(String deviceUUID, String path, int pkg, int block, final Promise promise) {
+        try {
+            final int nexCommand = 0;
+            final Handler handler = new Handler();
+            final HashMap<String, Subscription> subscriptionHashMap = new HashMap<>();
+
+            List<String> blocks = Arrays.asList("01");
+            byte[] fileData = FileUtil.readBytesFromPackageUpdateZip(path);
+            blocks.addAll(buildBlocks(fileData));
+
+            final List<String> commands = new ArrayList<>();
+            int i;
+            for (i = 0; i < blocks.size(); i++) {
+                commands.add(
+                    new Package(pkg + i, "07", Arrays.asList(
+                        String.format("%02x%02x", (block + i) & 0xff, ((block + i) >> 8) & 0xff),
+                        blocks.get(i)
+                    )).toCommand()
+                );
+            }
+            commands.add(
+                new Package(pkg + i + 1, "07", Arrays.asList("FFFF", "")).toCommand()
+            );
+
+
+            final Characteristic characteristic = getCharacteristicOrReject(
+                deviceUUID, "ffe0", "ffe1", promise);
+            final BluetoothGattCharacteristic gattCharacteristic = characteristic.getNativeCharacteristic();
+
+            final RxBleConnection connection = getConnectionOrReject(characteristic.getService().getDevice(), promise);
+            if (connection == null) {
+                return;
+            }
+
+
+            final Runnable writeTimeout = new Runnable() {
+                @Override
+                public void run() {
+                    Subscription subWrite = subscriptionHashMap.get("WRITE");
+                    if (subWrite.isUnsubscribed()) subWrite.unsubscribe();
+
+                    Subscription subMonitor = subscriptionHashMap.get("MONITOR");
+                    if (subMonitor.isUnsubscribed()) subMonitor.unsubscribe();
+
+                    promise.reject(new TimeoutException());
+                }
+            };
+
+            Runnable writeCommand = new Runnable() {
+                @Override
+                public void run() {
+                    String cmd = commands.get(nexCommand);
+                    Subscription sub = connection.createNewLongWriteBuilder()
+                        .setCharacteristic(characteristic.getNativeCharacteristic())
+                        .setBytes(StringUtil.stringToByteArray(cmd, Charset.forName("ISO-8859-1")))
+                        .build().subscribe();
+                    subscriptionHashMap.put("WRITE", sub);
+                    handler.postDelayed(writeTimeout, 2000);
+                }
+            };
+
+            final StringBuffer inBuffer = new StringBuffer();
+            Subscription monitorSub = Observable.just(connection)
+                .flatMap(new Func1<RxBleConnection, Observable<Observable<byte[]>>>() {
+                    @Override
+                    public Observable<Observable<byte[]>> call(RxBleConnection connection) {
+                        int properties = gattCharacteristic.getProperties();
+                        if ((properties & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
+                            return connection.setupNotification(gattCharacteristic);
+                        }
+                        return Observable.error(new CannotMonitorCharacteristicException(gattCharacteristic));
+                    }
+                })
+                .flatMap(new Func1<Observable<byte[]>, Observable<byte[]>>() {
+                    @Override
+                    public Observable<byte[]> call(Observable<byte[]> observable) {
+                        return observable;
+                    }
+                })
+//                .doOnUnsubscribe(new Action0() {
+//                    @Override
+//                    public void call() {
+//                        promise.resolve(null);
+//                        transactions.removeSubscription(transactionId);
+//                    }
+//                })
+//                .doOnError(new Action1<Throwable>() {
+//                    @Override
+//                    public void call(Throwable throwable) {
+//
+//                    }
+//                })
+                .doOnNext(new Action1<byte[]>() {
+                    @Override
+                    public void call(byte[] bytes) {
+                        String value = StringUtil.byteArrayToString(bytes, Charset.forName("ISO-8859-1"));
+
+                        handler.removeCallbacks(writeTimeout);
+                        String msg = String.format(Locale.US, "Recebido %s", value);
+                        Log.i("RNVerti", msg);
+
+                        inBuffer.append(value);
+                        int found = inBuffer.indexOf("\r\n");
+                        if (found >= 0) {
+                            String cmd = inBuffer.substring(0, found);
+                            inBuffer.setLength(0);
+
+                            Log.i("RNVerti", String.format("Recebido comando: %s", cmd));
+                            // novo write do próximo comando
+                        }
+                    }
+                })
+                .doOnCompleted(new Action0() {
+                    @Override
+                    public void call() {
+                        Log.i("RNVerti", "Completed");
+                    }
+                })
+                .subscribe();
+            subscriptionHashMap.put("MONITOR", monitorSub);
+
+            handler.post(writeCommand);
+
+        } catch (IOException ioe) {
+            promise.reject(ioe);
+        }
+    }
+
+    @TargetApi(Build.VERSION_CODES.LOLLIPOP)
+    @ReactMethod
+    public void setHighPriority(String deviceUUID, final Promise promise) {
+        Log.i("RNVerti", "Build v. " + Build.VERSION.SDK_INT);
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+            promise.resolve(true);
+            return;
+        }
+
+        final Device device = getDeviceOrReject(deviceUUID, promise);
+        if (device == null) {
+            return;
+        }
+
+        final RxBleConnection connection = getConnectionOrReject(device, promise);
+        if (connection == null) {
+            return;
+        }
+
+        connection.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH, 1000, TimeUnit.MILLISECONDS)
+            .doOnCompleted(new Action0() {
+                @Override
+                public void call() {
+                    Log.i("RNVerti", "Prioridade requisitada");
+                    promise.resolve(true);
+                }
+            })
+            .doOnError(new Action1<Throwable>() {
+                @Override
+                public void call(Throwable throwable) {
+                    promise.reject(throwable);
+                }
+            })
+            .subscribe();
+    }
+
+    @ReactMethod
+    public void sendFileBlock(String deviceUUID, int type, int pkgNo, int blockNo, final Promise promise) {
+        Log.i("RNVerti", String.format("D %s | T %d | P %d | B %d", deviceUUID, type, pkgNo, blockNo));
+        final Charset charset = Charset.forName("ISO-8859-1");
+
+        final Characteristic characteristic = getCharacteristicOrReject(
+            deviceUUID, "ffe0", "ffe1", promise);
+        if (characteristic == null) return;
+
+        final RxBleConnection connection = getConnectionOrReject(characteristic.getService().getDevice(), promise);
+        if (connection == null) return;
+
+        final BluetoothGattCharacteristic gattCharacteristic = characteristic.getNativeCharacteristic();
+        gattCharacteristic
+            .setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE);
+
+        List<String> blocks = (type == 0) ? this.configBlocks : this.firmwareBlocks;
+        List<String> data = new ArrayList<>();
+        if (blockNo < blocks.size()) {
+            data.add(String.format("%02x%02x", blockNo & 0xff, (blockNo >> 8) & 0xff));
+            data.add(blocks.get(blockNo));
+        } else {
+            data.add("FFFF");
+            data.add("");
+        }
+
+        Log.i("RNVerti", String.format("Escrevendo bloco %d - %s | %s", blockNo, data.get(0), data.get(1)));
+        String cmd = new Package(pkgNo, "07", data).toCommand();
+
+        safeLongWriteCharacteristicForDevice(
+            characteristic,
+            cmd.getBytes(charset),
+            null,
+            new SafePromise(promise)
+        );
     }
 }
