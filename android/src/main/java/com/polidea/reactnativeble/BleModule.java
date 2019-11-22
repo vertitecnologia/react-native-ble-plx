@@ -52,6 +52,7 @@ import com.polidea.rxandroidble.RxBleClient;
 import com.polidea.rxandroidble.RxBleConnection;
 import com.polidea.rxandroidble.RxBleDevice;
 import com.polidea.rxandroidble.RxBleDeviceServices;
+import com.polidea.rxandroidble.exceptions.BleCharacteristicNotFoundException;
 import com.polidea.rxandroidble.internal.RxBleLog;
 import com.polidea.rxandroidble.scan.ScanFilter;
 import com.polidea.rxandroidble.scan.ScanResult;
@@ -91,6 +92,8 @@ import static com.polidea.rxandroidble.scan.ScanSettings.CALLBACK_TYPE_ALL_MATCH
 import static com.polidea.rxandroidble.scan.ScanSettings.SCAN_MODE_LOW_POWER;
 
 public class BleModule extends ReactContextBaseJavaModule {
+
+    private static final int BLOCK_SIZE = 200;
 
     // Name of module
     private static final String NAME = "BleClientManager";
@@ -2120,9 +2123,9 @@ public class BleModule extends ReactContextBaseJavaModule {
 
     private List<String> buildBlocks(byte[] fileData) throws IOException {
         List<String> blocks = new ArrayList<>();
-        for (int i = 0; i <= (fileData.length / 450); i++) {
-            int from = i * 450;
-            int to = Math.min(from + 450, fileData.length);
+        for (int i = 0; i <= (fileData.length / BLOCK_SIZE); i++) {
+            int from = i * BLOCK_SIZE;
+            int to = Math.min(from + BLOCK_SIZE, fileData.length);
 
             byte[] blockData = Arrays.copyOfRange(fileData, from, to);
             ByteArrayInputStream bis = new ByteArrayInputStream(blockData);
