@@ -1,6 +1,6 @@
 package br.com.vertitecnologia.vmpay.utils;
 
-import android.support.annotation.NonNull;
+import androidx.annotation.NonNull;
 
 import java.nio.charset.Charset;
 import java.util.Locale;
